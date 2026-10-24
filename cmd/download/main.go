@@ -26,10 +26,20 @@ var schema = `
 	create table file_type (
 	    file_type string,
 	    name string,
-	    active integer
+	    active integer,
+	    base_path string
 	);
 
-	create table load_control (
+	create table file_control {
+	    year text, 
+	    month text,
+	    file_type text,
+	    filename text,
+	    download_url text,
+	    status text
+	}
+
+	/*create table load_control (
 	    year text,
 	    month text,
 	    file_type text,
@@ -39,7 +49,7 @@ var schema = `
 	    load_date timestamp,
 	    proc_date timestamp,
 	    description text
-	);
+	);*/
 
 	create table parameter (
 	    parameter text,
@@ -52,8 +62,9 @@ var drops = `
 drop table year;
 drop table month;
 drop table file_type;
-drop table load_control;
+--
 drop table parameter;
+drop table file_control;
 `
 
 var queryFiles = `
@@ -82,6 +93,7 @@ type FileType struct {
 	FileType string `db:"file_type"`
 	Name     string `db:"name"`
 	Active   bool   `db:"active"`
+	BasePath string `db:"base_path"`
 }
 
 type LoadControl struct {
@@ -94,6 +106,15 @@ type LoadControl struct {
 	LoadDate    time.Time `db:"load_date"`
 	ProcDate    time.Time `db:"proc_date"`
 	Description string    `db:"description"`
+}
+
+type FileControl struct {
+	Year        string `db:"year"`
+	Month       string `db:"month"`
+	FileType    string `db:"file_type"`
+	Filename    string `db:"filename"`
+	DownloadURL string `db:"download_url"`
+	Status      string `db:"status"`
 }
 
 type Parameter struct {
@@ -150,6 +171,7 @@ func (w *Worker) Start() {
 			// El canal de jobs se ingresa a la cola al estar disponible
 			w.Queue <- w.JobChan
 			select {
+			// espera recibir un Job
 			case job := <-w.JobChan:
 				w.Wg.Add(1)
 				// procesar el trabajo recibido
@@ -246,17 +268,26 @@ func main() {
 		log.Fatalf("error conectando con la base de datos de control [%v]", err.Error())
 	}
 
+	// **********************************************************
+	// flags
+	// **********************************************************
 	var initDb bool
 	var dropTables bool
 	var seed bool
 	var deleteFiles bool
 	var downloadFiles bool
+	var convertFiles bool
 	flag.BoolVar(&initDb, "init", false, "Initialize database creating the tables")
 	flag.BoolVar(&dropTables, "drop", false, "Drop all the tables")
 	flag.BoolVar(&seed, "seed", false, "Seed the database with default data")
 	flag.BoolVar(&deleteFiles, "del-files", false, "Delete the files previous to download")
 	flag.BoolVar(&downloadFiles, "download", false, "Download all the configured files")
+	flag.BoolVar(&convertFiles, "convert", false, "Convert source files on clean files ")
 	flag.Parse()
+
+	// **********************************************************
+	// flags
+	// **********************************************************
 
 	log.Println("Flags :")
 	log.Printf("	- initDB 		-> [%v]\n", initDb)
@@ -264,6 +295,7 @@ func main() {
 	log.Printf("	- seed 			-> [%v]\n", seed)
 	log.Printf("	- del-files		-> [%v]\n", deleteFiles)
 	log.Printf("	- download		-> [%v]\n", downloadFiles)
+	log.Printf("	- convert		-> [%v]\n", convertFiles)
 
 	if deleteFiles {
 		fmt.Println("... Eliminando archivos")
@@ -312,11 +344,11 @@ func main() {
 		}
 
 		// file types
-		tx.MustExec("insert into file_type(file_type, name, active) values ($1, $2, $3)", "dg_sa_", "Saldo adeudado por departamento", 1)
-		tx.MustExec("insert into file_type(file_type, name, active) values ($1, $2, $3)", "s_sa_", "Saldo adeudado", 1)
-		tx.MustExec("insert into file_type(file_type, name, active) values ($1, $2, $3)", "s_mo_", "Montos otorgados", 1)
-		tx.MustExec("insert into file_type(file_type, name, active) values ($1, $2, $3)", "s_csa_", "Saldo adeudado por categoría de riesgo", 1)
-		tx.MustExec("insert into file_type(file_type, name, active) values ($1, $2, $3)", "s_cmo_", "Monto otorgado por categoría de riesgo", 1)
+		// tx.MustExec("insert into file_type(file_type, name, active, base_path) values ($1, $2, $3)", "dg_sa_", "Saldo adeudado por departamento", 1)
+		tx.MustExec("insert into file_type(file_type, name, active, base_path) values ($1, $2, $3, $4)", "s_sa_", "Saldo adeudado", 1, "https://ssf.gob.sv/descargas/balances/xls/s_sa_")
+		tx.MustExec("insert into file_type(file_type, name, active, base_path) values ($1, $2, $3, $4)", "s_mo_", "Montos otorgados", 1, "https://ssf.gob.sv/descargas/balances/xls/s_mo")
+		// tx.MustExec("insert into file_type(file_type, name, active, base_path) values ($1, $2, $3)", "s_csa_", "Saldo adeudado por categoría de riesgo", 1)
+		// tx.MustExec("insert into file_type(file_type, name, active, base_path) values ($1, $2, $3)", "s_cmo_", "Monto otorgado por categoría de riesgo", 1)
 
 		// parameters
 		tx.MustExec("insert into parameter(parameter, value, active) values ($1, $2, $3)", "DOWNLOAD_URL_PREFIX", "https://ssf.gob.sv/descargas/balances/xls/", 1)
@@ -331,7 +363,6 @@ func main() {
 
 	if downloadFiles {
 		log.Println("Inicializando descargas")
-		start := time.Now()
 		// query de archivos a extraer
 		rows, err := db.Queryx(queryFiles)
 		if err != nil {
@@ -339,6 +370,7 @@ func main() {
 		}
 
 		//
+		start := time.Now()
 		dd := NewDispatcher(10, db).Start()
 
 		//
@@ -352,7 +384,11 @@ func main() {
 		end := time.Now()
 		log.Printf(">>> Tiempo de ejecución: [%v]", end.Sub(start).Seconds())
 		dd.Wg.Wait()
-		//time.Sleep(5 * time.Second)
+		// time.Sleep(5 * time.Second)
+	}
+
+	if convertFiles {
+
 	}
 
 }
@@ -363,7 +399,6 @@ func downloader(db *sqlx.DB, lc Job, wg *sync.WaitGroup) {
 							values (:year, :month, :file_type, :download_url, :filename, :status, :load_date, :description)`
 
 	log.Printf("... nombre de archivo a descargar -> %s", lc.Filename)
-
 	resp, err := grab.Get("./files", lc.DownloadURL)
 	if err != nil {
 		lc.Description = fmt.Sprintf("Descarga de archivos en error [%v]", err.Error())
@@ -371,6 +406,7 @@ func downloader(db *sqlx.DB, lc Job, wg *sync.WaitGroup) {
 		lc.Description = fmt.Sprintf("Descarga de archivos satisfactoria bytes [%v]", resp.Size())
 	}
 	lc.LoadDate = time.Now()
+	lc.Status = 1
 	r, err := db.NamedExec(insertLoadControl, lc)
 	if err != nil {
 		log.Printf("--- No fue posible insertar registro de control  [%v]", err.Error())
